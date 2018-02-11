@@ -32,6 +32,8 @@ import java.util.Map.Entry;
 import java.util.Set;
 import java.util.SortedMap;
 import java.util.TreeMap;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -95,6 +97,7 @@ import org.apache.accumulo.master.replication.MasterReplicationCoordinator;
 import org.apache.accumulo.master.replication.ReplicationDriver;
 import org.apache.accumulo.master.replication.WorkDriver;
 import org.apache.accumulo.master.state.TableCounts;
+import org.apache.accumulo.master.status.TimeoutTaskExecutor;
 import org.apache.accumulo.server.Accumulo;
 import org.apache.accumulo.server.AccumuloServerContext;
 import org.apache.accumulo.server.HighlyAvailableService;
@@ -1080,60 +1083,87 @@ public class Master extends AccumuloServerContext implements LiveTServerSet.List
 
   private SortedMap<TServerInstance,TabletServerStatus> gatherTableInformation(Set<TServerInstance> currentServers) {
     long start = System.currentTimeMillis();
+
     int threads = Math.max(getConfiguration().getCount(Property.MASTER_STATUS_THREAD_POOL_SIZE), 1);
-    ExecutorService tp = Executors.newFixedThreadPool(threads);
-    final SortedMap<TServerInstance,TabletServerStatus> result = new TreeMap<>();
-    for (TServerInstance serverInstance : currentServers) {
-      final TServerInstance server = serverInstance;
-      tp.submit(new Runnable() {
-        @Override
-        public void run() {
-          try {
-            Thread t = Thread.currentThread();
-            String oldName = t.getName();
-            try {
-              t.setName("Getting status from " + server);
-              TServerConnection connection = tserverSet.getConnection(server);
-              if (connection == null)
-                throw new IOException("No connection to " + server);
-              TabletServerStatus status = connection.getTableMap(false);
-              result.put(server, status);
-            } finally {
-              t.setName(oldName);
-            }
-          } catch (Exception ex) {
-            log.error("unable to get tablet server status {} {}", server, ex.toString());
-            log.debug("unable to get tablet server status {}", server, ex);
-            if (badServers.get(server).incrementAndGet() > MAX_BAD_STATUS_COUNT) {
-              log.warn("attempting to stop {}", server);
-              try {
-                TServerConnection connection = tserverSet.getConnection(server);
-                if (connection != null) {
-                  connection.halt(masterLock);
-                }
-              } catch (TTransportException e) {
-                // ignore: it's probably down
-              } catch (Exception e) {
-                log.info("error talking to troublesome tablet server", e);
-              }
-              badServers.remove(server);
-            }
-          }
+    long timeout = getConfiguration().getTimeInMillis(Property.MASTER_STATUS_TIMEOUT);
+    final SortedMap<TServerInstance,TabletServerStatus> results = new ConcurrentSkipListMap<>();
+
+    try (TimeoutTaskExecutor<TabletServerStatus,GetTServerStatus> executor = new TimeoutTaskExecutor<>(Executors.newFixedThreadPool(threads), timeout,
+        currentServers.size())) {
+      executor.onException((task, e) -> log.error("Exception occurred while getting status from " + task.getServer(), e));
+      executor.onSuccess((task, result) -> {
+        if (result != null) {
+          results.put(task.getServer(), result);
         }
       });
-    }
-    tp.shutdown();
-    try {
-      tp.awaitTermination(getConfiguration().getTimeInMillis(Property.TSERV_CLIENT_TIMEOUT) * 2, TimeUnit.MILLISECONDS);
+      executor.onTimeout((task) -> {
+        log.warn("Timed out while fetching status from " + task.getServer());
+        badServers.get(task.getServer()).getAndIncrement();
+      });
+
+      for (TServerInstance server : currentServers) {
+        executor.submit(new GetTServerStatus(server));
+      }
+
+      executor.complete();
     } catch (InterruptedException e) {
-      log.debug("Interrupted while fetching status");
+      Thread.currentThread().interrupt();
     }
+
     synchronized (badServers) {
       badServers.keySet().retainAll(currentServers);
-      badServers.keySet().removeAll(result.keySet());
+      badServers.keySet().removeAll(results.keySet());
     }
-    log.debug(String.format("Finished gathering information from %d servers in %.2f seconds", result.size(), (System.currentTimeMillis() - start) / 1000.));
-    return result;
+    log.debug(String.format("Finished gathering information from %d servers in %.2f seconds", results.size(), (System.currentTimeMillis() - start) / 1000.));
+    return results;
+  }
+
+  private class GetTServerStatus implements Callable<TabletServerStatus> {
+    private final TServerInstance server;
+
+    public GetTServerStatus(TServerInstance server) {
+      this.server = server;
+    }
+
+    public TServerInstance getServer() {
+      return server;
+    }
+
+    @Override
+    public TabletServerStatus call() throws Exception {
+      try {
+        Thread t = Thread.currentThread();
+        String oldName = t.getName();
+        try {
+          t.setName("Getting status from " + server);
+          LiveTServerSet.TServerConnection connection = tserverSet.getConnection(server);
+          if (connection == null)
+            throw new IOException("No connection to " + server);
+          return connection.getTableMap(false);
+        } finally {
+          t.setName(oldName);
+        }
+      } catch (Exception ex) {
+        log.error("unable to get tablet server status {} {}", server, ex.toString());
+        log.debug("unable to get tablet server status {}", server, ex);
+        if (badServers.get(server).incrementAndGet() > Master.MAX_BAD_STATUS_COUNT) {
+          log.warn("attempting to stop {}", server);
+          try {
+            LiveTServerSet.TServerConnection connection = tserverSet.getConnection(server);
+            if (connection != null) {
+              connection.halt(masterLock);
+            }
+          } catch (TTransportException e) {
+            // ignore: it's probably down
+          } catch (Exception e) {
+            log.info("error talking to troublesome tablet server", e);
+          }
+          badServers.remove(server);
+        }
+
+        return null;
+      }
+    }
   }
 
   public void run() throws IOException, InterruptedException, KeeperException {
